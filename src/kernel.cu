@@ -41,57 +41,88 @@ __global__ void calculateIoUMatrix(BoundingBox* d_boxes, float* d_iouMatrix, int
         d_iouMatrix[row * n + col] = iou;
     }
 }
-int main() {
-    const int N = 4; // נבדוק על 4 תיבות
-    size_t boxes_size = N * sizeof(BoundingBox);
-    size_t matrix_size = N * N * sizeof(float);
+__global__ void nmsKernel(float* d_iouMatrix, bool* d_isSuppressed, int n, float threshold) {
+    // 1. נמצא איזה ת'רד אנחנו (איזו תיבה אנחנו בודקים)
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // 1. הגדרת 4 תיבות ב-CPU
+    // 2. בדיקה שלא חרגנו ממספר התיבות
+    if (i < n) {
+        // 1. נניח שהתיבה שורדת
+        d_isSuppressed[i] = false;
+
+        // 2. נעבור על כל התיבות שחזקות ממנה (j < i)
+        for (int j = 0; j < i; j++) {
+            // 3. נבדוק את החפיפה במטריצה
+            if (d_iouMatrix[i * n + j] > threshold) {
+                // 4. אם חפפנו יותר מדי לתיבה חזקה יותר - נפסלנו
+                d_isSuppressed[i] = true;
+                break; // סיימנו עם התיבה הזאת
+            }
+        }
+    }
+}
+
+int main() {
+    // --- 1. הגדרת נתונים בסיסיים ---
+    const int N = 4;
+    float threshold = 0.5f;
+
+    // הגדרת 4 תיבות (שים לב שהן לא ממוינות כאן לפי Confidence)
     BoundingBox h_boxes[N] = {
-        {100, 100, 200, 200, 0.9}, // תיבה 0
-        {110, 110, 210, 210, 0.8}, // תיבה 1 (חפיפה גבוהה עם 0)
-        {500, 500, 600, 600, 0.7}, // תיבה 2 (רחוקה מאוד)
-        {150, 150, 250, 250, 0.6}  // תיבה 3 (חפיפה חלקית עם 0 ו-1)
+        {100, 100, 200, 200, 0.90f}, // תיבה 0 (כלב)
+        {110, 110, 210, 210, 0.95f}, // תיבה 1 (כלב - חופפת ל-0, חזקה יותר!)
+        {500, 500, 600, 600, 0.80f}, // תיבה 2 (חתול - רחוקה)
+        {150, 150, 250, 250, 0.70f}  // תיבה 3 (כלב - חופפת ל-1, חלשה יותר)
     };
-    // מיון התיבות לפי Confidence מהגבוה לנמוך
+
+    // --- 2. מיון לפי Confidence (CPU) ---
+    // חובה לבצע לפני ה-NMS כדי שהתיבה הכי חזקה תהיה באינדקס 0
     std::sort(h_boxes, h_boxes + N, [](BoundingBox a, BoundingBox b) {
         return a.confidence > b.confidence;
         });
 
-    // עכשיו אפשר להמשיך להעתקה ל-GPU כרגיל...
-    float h_matrix[N * N];
+    std::cout << "Boxes sorted by confidence. Top box: " << h_boxes[0].confidence << std::endl;
 
-    // 2. הקצאת זיכרון ב-GPU
+    // --- 3. הכנת זיכרון ב-GPU ---
     BoundingBox* d_boxes;
     float* d_iouMatrix;
-    cudaMalloc(&d_boxes, boxes_size);
-    cudaMalloc(&d_iouMatrix, matrix_size);
+    bool* d_isSuppressed;
 
-    // 3. העתקה ל-GPU
-    cudaMemcpy(d_boxes, h_boxes, boxes_size, cudaMemcpyHostToDevice);
+    cudaMalloc(&d_boxes, N * sizeof(BoundingBox));
+    cudaMalloc(&d_iouMatrix, N * N * sizeof(float));
+    cudaMalloc(&d_isSuppressed, N * sizeof(bool));
 
-    // 4. הגדרת ה-Grid (כמה ת'רדים לשלוח?)
+    // --- 4. העברת נתונים ל-GPU ---
+    cudaMemcpy(d_boxes, h_boxes, N * sizeof(BoundingBox), cudaMemcpyHostToDevice);
+
+    // --- 5. הרצת קרנל מטריצת IoU (שלב א') ---
     // נשתמש בבלוק של 16x16 ת'רדים
     dim3 threadsPerBlock(16, 16);
     dim3 blocksPerGrid((N + 15) / 16, (N + 15) / 16);
-
-    // 5. הרצה!
     calculateIoUMatrix << <blocksPerGrid, threadsPerBlock >> > (d_boxes, d_iouMatrix, N);
 
-    // 6. העתקת המטריצה חזרה ל-CPU
-    cudaMemcpy(h_matrix, d_iouMatrix, matrix_size, cudaMemcpyDeviceToHost);
+    // --- 6. הרצת קרנל NMS (שלב ב') ---
+    // כל ת'רד בודק תיבה אחת מול המטריצה
+    nmsKernel << <1, N >> > (d_iouMatrix, d_isSuppressed, N, threshold);
 
-    // 7. הדפסת המטריצה בצורה יפה
-    std::cout << "IoU Matrix (" << N << "x" << N << "):" << std::endl;
+    // --- 7. הבאת תוצאות חזרה ל-CPU ---
+    bool h_isSuppressed[N];
+    cudaMemcpy(h_isSuppressed, d_isSuppressed, N * sizeof(bool), cudaMemcpyDeviceToHost);
+
+    // --- 8. הדפסת תוצאות סופיות ---
+    std::cout << "\n--- NMS FINAL RESULTS ---" << std::endl;
     for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            printf("%.2f ", h_matrix[i * N + j]);
-        }
-        std::cout << std::endl;
+        std::string result = h_isSuppressed[i] ? "[REJECTED]" : "[KEEP]";
+        printf("Box %d: Conf: %.2f | Status: %s\n", i, h_boxes[i].confidence, result.c_str());
     }
 
-    // ניקוי
+    // --- 9. ניקוי זיכרון ---
     cudaFree(d_boxes);
     cudaFree(d_iouMatrix);
+    cudaFree(d_isSuppressed);
+
+    std::cout << "\nPress Enter to exit...";
+    std::cin.get();
+
     return 0;
 }
