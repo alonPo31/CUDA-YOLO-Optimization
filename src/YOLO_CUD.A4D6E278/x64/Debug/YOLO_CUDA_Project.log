@@ -1,8 +1,7 @@
-﻿  Compiling CUDA source file kernel.cu...
+﻿  Compiling CUDA source file nms.cu...
   
-  C:\Alon\CUDA-YOLO-Optimization\src>"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe" -gencode=arch=compute_75,code=\"sm_75,compute_75\" --use-local-env -ccbin "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" -x cu   -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\include"  -G   --keep-dir YOLO_CUD.A4D6E278\x64\Debug  -maxrregcount=0    --machine 64 --compile -cudart hybrid  -g  -DWIN32 -DWIN64 -D_DEBUG -D_CONSOLE -D_MBCS -Xcompiler "/EHsc /W3 /nologo /Od /FS /Zi /RTC1 /MDd " -Xcompiler "/FdYOLO_CUD.A4D6E278\x64\Debug\vc143.pdb" -o C:\Alon\CUDA-YOLO-Optimization\src\YOLO_CUD.A4D6E278\x64\Debug\kernel.cu.obj "C:\Alon\CUDA-YOLO-Optimization\src\kernel.cu" 
-  kernel.cu
-  tmpxft_0000805c_00000000-7_kernel.cudafe1.cpp
-     Creating library C:\Alon\CUDA-YOLO-Optimization\src\x64\Debug\YOLO_CUDA_Project.lib and object C:\Alon\CUDA-YOLO-Optimization\src\x64\Debug\YOLO_CUDA_Project.exp
-LINK : warning LNK4098: defaultlib 'LIBCMT' conflicts with use of other libs; use /NODEFAULTLIB:library
+  C:\Alon\CUDA-YOLO-Optimization\src>"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe" -gencode=arch=compute_75,code=\"sm_75,compute_75\" --use-local-env -ccbin "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" -x cu   -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\include" -I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\include"  -G   --keep-dir YOLO_CUD.A4D6E278\x64\Debug  -maxrregcount=0    --machine 64 --compile -cudart hybrid  -g  -DWIN32 -DWIN64 -D_DEBUG -D_CONSOLE -D_MBCS -Xcompiler "/EHsc /W3 /nologo /Od /FS /Zi /RTC1 /MDd " -Xcompiler "/FdYOLO_CUD.A4D6E278\x64\Debug\vc143.pdb" -o C:\Alon\CUDA-YOLO-Optimization\src\YOLO_CUD.A4D6E278\x64\Debug\nms.cu.obj "C:\Alon\CUDA-YOLO-Optimization\src\nms.cu" 
+  nms.cu
+  tmpxft_00008d34_00000000-7_nms.cudafe1.cpp
+  main.cpp
   YOLO_CUDA_Project.vcxproj -> C:\Alon\CUDA-YOLO-Optimization\src\x64\Debug\YOLO_CUDA_Project.exe

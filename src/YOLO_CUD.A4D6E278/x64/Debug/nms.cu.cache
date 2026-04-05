@@ -1,4 +1,4 @@
-Identity=kernel.cu
+Identity=nms.cu
 AdditionalCompilerOptions=
 AdditionalCompilerOptions=
 AdditionalDependencies=
@@ -8,7 +8,7 @@ AdditionalOptions=
 AdditionalOptions=
 CodeGeneration=compute_75,sm_75
 CodeGeneration=compute_75,sm_75
-CompileOut=C:\Alon\CUDA-YOLO-Optimization\src\YOLO_CUD.A4D6E278\x64\Debug\kernel.cu.obj
+CompileOut=C:\Alon\CUDA-YOLO-Optimization\src\YOLO_CUD.A4D6E278\x64\Debug\nms.cu.obj
 CudaRuntime=Hybrid
 CudaToolkitCustomDir=
 DebugInformationFormat=ProgramDatabase
