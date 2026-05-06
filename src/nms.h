@@ -1,4 +1,4 @@
-﻿#ifndef NMS_H
+#ifndef NMS_H
 #define NMS_H
 
 struct BoundingBox {
@@ -6,7 +6,7 @@ struct BoundingBox {
     float confidence;
 };
 
-// הבלוק הזה מבטיח שהקומפיילר לא "יעוות" את שם הפונקציה
+// Prevents C++ name mangling so the function can be linked from plain C or other TUs
 #ifdef __cplusplus
 extern "C" {
 #endif
