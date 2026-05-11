@@ -10,6 +10,7 @@
 #include <algorithm>           // std::sort
 #include <fstream>             // file writes for the web frontend
 #include "nms.h"
+#include "tracker.h"
 
 // COCO class names in YOLOv8 output order
 static const char* CLASS_NAMES[] = {
@@ -124,6 +125,11 @@ int main() {
     int    configSyncCounter = 0;
     int    threshAdjCounter  = 0; // hysteresis: only adjust confThreshold every 10 frames
 
+    // Tracking state — persists across frames
+    const int   MAX_AGE       = 5;    // frames a track survives without a matched detection
+    const float IOU_THRESHOLD = 0.3f; // minimum IoU to accept a track-detection match
+    std::vector<KalmanTracker> tracks;
+
     // 5. Main inference loop
     while (running.load()) {
 
@@ -208,6 +214,8 @@ int main() {
         }
 
         int keptCount = 0; // number of boxes surviving NMS (reported to the frontend)
+        std::vector<BoundingBox> detections;
+        std::vector<int>         detClasses;
         if (!candidates.empty()) {
             // Sort by confidence descending using an index array to keep candidateClasses in sync
             std::vector<int> order(candidates.size());
@@ -229,40 +237,96 @@ int main() {
             if (nmsEnabled)
                 runCudaNMS(sorted_boxes.data(), n, nmsThreshold, nmsResults.data());
 
-            // 9. Draw surviving boxes
+            // 9. Collect surviving boxes for the tracking stage
             for (int i = 0; i < n; i++) {
-                if (nmsResults[i] != 0) continue; // 0 = keep, 1 = suppressed
+                if (nmsResults[i] != 0) continue;
                 keptCount++;
-
-                cv::Rect drawingRect(
-                    (int)sorted_boxes[i].x1,
-                    (int)sorted_boxes[i].y1,
-                    (int)(sorted_boxes[i].x2 - sorted_boxes[i].x1),
-                    (int)(sorted_boxes[i].y2 - sorted_boxes[i].y1)
-                );
-
-                cv::rectangle(img, drawingRect, cv::Scalar(0, 255, 0), 2);
-
-                std::string label = std::string(CLASS_NAMES[sorted_classes[i]]) + " "
-                                  + std::to_string(sorted_boxes[i].confidence).substr(0, 4);
-                cv::putText(img, label, drawingRect.tl() + cv::Point(0, -4),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+                detections.push_back(sorted_boxes[i]);
+                detClasses.push_back(sorted_classes[i]);
             }
         }
 
-        // Dynamic threshold adjustment with hysteresis (every 10 frames to prevent flickering)
-        if (++threshAdjCounter >= 10) {
+        // ── 10. Tracking: Kalman prediction + Hungarian assignment ───────────────
+
+        int nT = (int)tracks.size();
+        int nD = (int)detections.size();
+
+        // Step 1: advance every existing track's state one frame forward
+        for (auto& t : tracks)
+            t.predict();
+
+        std::vector<bool> detMatched(nD, false);
+
+        if (nT > 0 && nD > 0) {
+            // Step 2: build cost matrix — cost[i][j] = 1 - IoU(predicted box i, detection j)
+            std::vector<std::vector<float>> costMatrix(nT, std::vector<float>(nD, 1.0f));
+            for (int i = 0; i < nT; i++) {
+                BoundingBox pred = tracks[i].getBox();
+                for (int j = 0; j < nD; j++)
+                    costMatrix[i][j] = 1.0f - computeIoU(pred, detections[j]);
+            }
+
+            // Step 3: find the globally optimal assignment
+            std::vector<int> assignment = hungarian(costMatrix, nT, nD);
+
+            // Step 4: update matched tracks; reject weak IoU matches
+            for (int i = 0; i < nT; i++) {
+                int j = assignment[i];
+                if (j != -1 && (1.0f - costMatrix[i][j]) >= IOU_THRESHOLD) {
+                    tracks[i].update(detections[j]);
+                    tracks[i].classId = detClasses[j];
+                    detMatched[j] = true;
+                }
+            }
+        }
+
+        // Step 5: spawn a new track for every unmatched detection
+        for (int j = 0; j < nD; j++) {
+            if (!detMatched[j]) {
+                KalmanTracker newTrack;
+                newTrack.init(detections[j]);
+                newTrack.classId = detClasses[j];
+                tracks.push_back(newTrack);
+            }
+        }
+
+        // Step 6: purge tracks that have gone too long without a match
+        {
+            std::vector<KalmanTracker> live;
+            for (auto& t : tracks)
+                if (t.timeSinceUpdate <= MAX_AGE)
+                    live.push_back(t);
+            tracks = live;
+        }
+
+        // Step 7: draw every track that was matched this frame (timeSinceUpdate == 0)
+        for (const auto& t : tracks) {
+            if (t.timeSinceUpdate > 0) continue;
+            BoundingBox box = t.getBox();
+            cv::Rect r(
+                (int)box.x1, (int)box.y1,
+                (int)(box.x2 - box.x1), (int)(box.y2 - box.y1)
+            );
+            cv::rectangle(img, r, cv::Scalar(0, 255, 0), 2);
+            std::string label = "ID:" + std::to_string(t.id) + " "
+                              + std::string(CLASS_NAMES[t.classId]);
+            cv::putText(img, label, r.tl() + cv::Point(0, -4),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+        }
+
+        // Dynamic threshold adjustment with hysteresis (every 5 frames to prevent flickering)
+        if (++threshAdjCounter >= 5) {
             threshAdjCounter = 0;
-            // Pre-NMS: too many weak candidates entering NMS → raise; too few → lower
-            if ((int)candidates.size() > 20)
-                confThreshold = std::min(confThreshold + 0.005f, 0.75f);
-            else if ((int)candidates.size() < 3)
-                confThreshold = std::max(confThreshold - 0.005f, 0.15f);
-            // Post-NMS: too many boxes shown → raise; nothing shown → lower
+            // Pre-NMS: only lower threshold if barely anything is detected
+            if ((int)candidates.size() < 3)
+                confThreshold = std::max(confThreshold - 0.02f, 0.15f);
+            // Post-NMS: adjust threshold based on kept count
             if (keptCount > 10)
-                confThreshold = std::min(confThreshold + 0.005f, 0.75f);
+                confThreshold = std::min(confThreshold + 0.02f, 0.75f);
             else if (keptCount < 1)
-                confThreshold = std::max(confThreshold - 0.005f, 0.15f);
+                confThreshold = std::max(confThreshold - 0.02f, 0.15f);
+            else if (confThreshold < 0.25f)
+                confThreshold = std::min(confThreshold + 0.01f, 0.25f); // recovery: drift back up to 0.25
         }
 
         // 10. FPS counter — updates once per second

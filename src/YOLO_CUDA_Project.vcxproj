@@ -106,9 +106,11 @@ odbccp32.lib</AdditionalDependencies>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="nms.h" />
+    <ClInclude Include="tracker.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="tracker.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
