@@ -27,6 +27,18 @@ static const char* CLASS_NAMES[] = {
     "toothbrush"
 };
 
+// Parse a quoted string value from raw JSON: finds "key":"value" and returns value.
+static std::string parseJsonString(const std::string& json, const std::string& key) {
+    std::string searchKey = "\"" + key + "\":";
+    auto p = json.find(searchKey);
+    if (p == std::string::npos) return "";
+    auto q = json.find("\"", p + searchKey.size());
+    if (q == std::string::npos) return "";
+    auto r = json.find("\"", q + 1);
+    if (r == std::string::npos) return "";
+    return json.substr(q + 1, r - q - 1);
+}
+
 // Shared buffer between the capture thread and the inference (main) thread.
 // The capture thread writes; the main thread reads.
 struct FrameBuffer {
@@ -57,20 +69,32 @@ int main() {
     net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
     net.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
 
-    // 3. Open camera (0 = default camera)
-    cv::VideoCapture cap(0);
+    // 3. Read initial video source from config (default: live camera)
+    std::string videoSource = "camera";
+    std::string videoPath   = "";
+    {
+        std::ifstream cf(configInPath);
+        if (cf.is_open()) {
+            std::string content, line;
+            while (std::getline(cf, line)) content += line;
+            std::string s = parseJsonString(content, "video_source");
+            std::string p = parseJsonString(content, "video_path");
+            if (!s.empty()) videoSource = s;
+            if (!p.empty()) videoPath   = p;
+        }
+    }
+
+    cv::VideoCapture cap;
+    if (videoSource == "file" && !videoPath.empty())
+        cap.open(videoPath);
+    else
+        cap.open(0);
     if (!cap.isOpened()) {
-        std::cerr << "ERROR: Could not open camera!" << std::endl;
+        std::cerr << "ERROR: Could not open video source!" << std::endl;
         return -1;
     }
-    std::cout << "Press 'q' to quit, 'n' to toggle NMS." << std::endl;
-
-    // Create window before the loop so the trackbar can be attached
-    cv::namedWindow("CUDA YOLO Detection", cv::WINDOW_AUTOSIZE);
-
     // NMS toggle: 1 = enabled, 0 = disabled
     int nmsEnabled = 1;
-    cv::createTrackbar("NMS", "CUDA YOLO Detection", &nmsEnabled, 1);
 
     // --- Thread synchronization primitives ---
 
@@ -82,41 +106,48 @@ int main() {
     std::condition_variable frameCv;
 
     FrameBuffer       buffer;
-    std::atomic<bool> running{ true }; // atomic = safe to read/write from two threads without a mutex
+    std::atomic<bool> running   { true };
+    // restarting: set to true while the capture thread is being replaced after a source switch,
+    // so the main loop does not exit during the brief moment running==false.
+    std::atomic<bool> restarting{ false };
 
-    // 4. Capture thread — runs in parallel with the main inference loop.
-    // While the GPU is busy with inference on frame N,
-    // this thread reads frame N+1 from the camera and runs blobFromImage on it.
-    // That overlap is the core pipeline parallelism benefit.
-    std::thread captureThread([&]() {
-        while (running.load()) {
-            cv::Mat frame;
-            if (!cap.read(frame) || frame.empty()) {
-                running.store(false);
-                frameCv.notify_one(); // wake main thread so it doesn't wait forever
-                break;
+    // 4. Capture thread factory — creates a thread that reads from the current cap.
+    // Called at startup and again each time the video source changes.
+    auto startCaptureThread = [&]() -> std::thread {
+        return std::thread([&]() {
+            while (running.load()) {
+                cv::Mat frame;
+                if (!cap.read(frame) || frame.empty()) {
+                    // End-of-file or camera disconnect. Only signal program exit if this
+                    // is not a deliberate source-switch restart.
+                    if (!restarting.load()) {
+                        running.store(false);
+                        frameCv.notify_one();
+                    }
+                    break;
+                }
+
+                // Preprocessing overlaps with GPU inference on the main thread
+                float sx = (float)frame.cols / 640.0f;
+                float sy = (float)frame.rows / 640.0f;
+                cv::Mat b = cv::dnn::blobFromImage(
+                    frame, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false
+                );
+
+                {
+                    std::unique_lock<std::mutex> lock(frameMtx);
+                    buffer.img    = std::move(frame);
+                    buffer.blob   = std::move(b);
+                    buffer.scaleX = sx;
+                    buffer.scaleY = sy;
+                    buffer.ready  = true;
+                }
+                frameCv.notify_one();
             }
+        });
+    };
 
-            // Preprocessing runs on this thread's CPU core, overlapping with GPU inference
-            float sx = (float)frame.cols / 640.0f;
-            float sy = (float)frame.rows / 640.0f;
-            cv::Mat b = cv::dnn::blobFromImage(
-                frame, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false
-            );
-
-            {
-                std::unique_lock<std::mutex> lock(frameMtx);
-                // std::move transfers ownership without copying pixel data (~0 cost)
-                buffer.img    = std::move(frame);
-                buffer.blob   = std::move(b);
-                buffer.scaleX = sx;
-                buffer.scaleY = sy;
-                buffer.ready  = true;
-            } // lock releases here (RAII), allowing the main thread to acquire it
-
-            frameCv.notify_one(); // signal that a new frame is available
-        }
-    });
+    std::thread captureThread = startCaptureThread();
 
     // FPS measurement
     double fps              = 0.0;
@@ -129,22 +160,31 @@ int main() {
     const int   MAX_AGE       = 5;    // frames a track survives without a matched detection
     const float IOU_THRESHOLD = 0.3f; // minimum IoU to accept a track-detection match
     std::vector<KalmanTracker> tracks;
+    bool trackingEnabled = true;
+
+    // Per-track color palette (BGR)
+    static const cv::Scalar TRACK_COLORS[] = {
+        {0,255,128}, {0,128,255}, {255,0,128}, {255,255,0},
+        {0,0,255},   {255,0,255}, {0,255,255}, {128,0,255},
+        {255,128,0}, {128,255,0}
+    };
+    const int N_COLORS = 10;
 
     // 5. Main inference loop
-    while (running.load()) {
+    while (true) {
 
         cv::Mat img, blob;
         float   scaleX, scaleY;
 
-        // Wait for the capture thread to produce a frame
+        // Wait for the capture thread to produce a frame.
+        // Only exit (break) when running==false AND we are not mid-restart.
         {
             std::unique_lock<std::mutex> lock(frameMtx);
+            frameCv.wait(lock, [&] {
+                return buffer.ready || (!running.load() && !restarting.load());
+            });
 
-            // Releases the mutex and sleeps until: new frame ready OR stop signal.
-            // Releasing the mutex while sleeping lets the capture thread keep writing.
-            frameCv.wait(lock, [&] { return buffer.ready || !running.load(); });
-
-            if (!running.load()) break;
+            if (!running.load() && !restarting.load()) break;
 
             // Take ownership of the frame — the capture thread can immediately write the next one
             img    = std::move(buffer.img);
@@ -165,7 +205,51 @@ int main() {
                 if (pos != std::string::npos) {
                     bool val = content.find("true", pos) != std::string::npos;
                     nmsEnabled = val ? 1 : 0;
-                    cv::setTrackbarPos("NMS", "CUDA YOLO Detection", nmsEnabled);
+                }
+                auto pos2 = content.find("\"tracking_enabled\":");
+                if (pos2 != std::string::npos)
+                    trackingEnabled = content.find("true", pos2) != std::string::npos;
+
+                // Check if the web UI switched the video source (e.g. user uploaded an MP4)
+                std::string newSource = parseJsonString(content, "video_source");
+                std::string newPath   = parseJsonString(content, "video_path");
+                if (newSource.empty()) newSource = "camera";
+
+                if (newSource != videoSource || newPath != videoPath) {
+                    std::cout << "Source switch: " << newSource << " " << newPath << std::endl;
+                    videoSource = newSource;
+                    videoPath   = newPath;
+
+                    // Stop the old capture thread
+                    restarting.store(true);
+                    running.store(false);
+                    frameCv.notify_all();
+                    captureThread.join();
+
+                    // Open the new source
+                    cap.release();
+                    if (videoSource == "file" && !videoPath.empty())
+                        cap.open(videoPath);
+                    else
+                        cap.open(0);
+                    if (!cap.isOpened()) {
+                        std::cerr << "Could not open new source, falling back to camera" << std::endl;
+                        cap.open(0);
+                        videoSource = "camera";
+                        videoPath   = "";
+                    }
+
+                    // Reset per-session state for the new source
+                    tracks.clear();
+                    confThreshold    = 0.25f;
+                    threshAdjCounter = 0;
+                    fps = 0.0; frameCount = 0;
+                    fpsTimer   = (double)cv::getTickCount();
+                    buffer.ready = false;
+
+                    running.store(true);
+                    restarting.store(false);
+                    captureThread = startCaptureThread();
                 }
             }
         }
@@ -251,67 +335,82 @@ int main() {
         int nT = (int)tracks.size();
         int nD = (int)detections.size();
 
-        // Step 1: advance every existing track's state one frame forward
-        for (auto& t : tracks)
-            t.predict();
+        if (trackingEnabled) {
+            // Step 1: advance every existing track's state one frame forward
+            for (auto& t : tracks)
+                t.predict();
 
-        std::vector<bool> detMatched(nD, false);
+            std::vector<bool> detMatched(nD, false);
 
-        if (nT > 0 && nD > 0) {
-            // Step 2: build cost matrix — cost[i][j] = 1 - IoU(predicted box i, detection j)
-            std::vector<std::vector<float>> costMatrix(nT, std::vector<float>(nD, 1.0f));
-            for (int i = 0; i < nT; i++) {
-                BoundingBox pred = tracks[i].getBox();
-                for (int j = 0; j < nD; j++)
-                    costMatrix[i][j] = 1.0f - computeIoU(pred, detections[j]);
-            }
+            if (nT > 0 && nD > 0) {
+                // Step 2: build cost matrix — cost[i][j] = 1 - IoU(predicted box i, detection j)
+                std::vector<std::vector<float>> costMatrix(nT, std::vector<float>(nD, 1.0f));
+                for (int i = 0; i < nT; i++) {
+                    BoundingBox pred = tracks[i].getBox();
+                    for (int j = 0; j < nD; j++)
+                        costMatrix[i][j] = 1.0f - computeIoU(pred, detections[j]);
+                }
 
-            // Step 3: find the globally optimal assignment
-            std::vector<int> assignment = hungarian(costMatrix, nT, nD);
+                // Step 3: find the globally optimal assignment
+                std::vector<int> assignment = hungarian(costMatrix, nT, nD);
 
-            // Step 4: update matched tracks; reject weak IoU matches
-            for (int i = 0; i < nT; i++) {
-                int j = assignment[i];
-                if (j != -1 && (1.0f - costMatrix[i][j]) >= IOU_THRESHOLD) {
-                    tracks[i].update(detections[j]);
-                    tracks[i].classId = detClasses[j];
-                    detMatched[j] = true;
+                // Step 4: update matched tracks; reject weak IoU matches
+                for (int i = 0; i < nT; i++) {
+                    int j = assignment[i];
+                    if (j != -1 && (1.0f - costMatrix[i][j]) >= IOU_THRESHOLD) {
+                        tracks[i].update(detections[j]);
+                        tracks[i].classId = detClasses[j];
+                        detMatched[j] = true;
+                    }
                 }
             }
-        }
 
-        // Step 5: spawn a new track for every unmatched detection
-        for (int j = 0; j < nD; j++) {
-            if (!detMatched[j]) {
-                KalmanTracker newTrack;
-                newTrack.init(detections[j]);
-                newTrack.classId = detClasses[j];
-                tracks.push_back(newTrack);
+            // Step 5: spawn a new track for every unmatched detection
+            for (int j = 0; j < nD; j++) {
+                if (!detMatched[j]) {
+                    KalmanTracker newTrack;
+                    newTrack.init(detections[j]);
+                    newTrack.classId = detClasses[j];
+                    tracks.push_back(newTrack);
+                }
             }
-        }
 
-        // Step 6: purge tracks that have gone too long without a match
-        {
-            std::vector<KalmanTracker> live;
-            for (auto& t : tracks)
-                if (t.timeSinceUpdate <= MAX_AGE)
-                    live.push_back(t);
-            tracks = live;
-        }
+            // Step 6: purge tracks that have gone too long without a match
+            {
+                std::vector<KalmanTracker> live;
+                for (auto& t : tracks)
+                    if (t.timeSinceUpdate <= MAX_AGE)
+                        live.push_back(t);
+                tracks = live;
+            }
 
-        // Step 7: draw every track that was matched this frame (timeSinceUpdate == 0)
-        for (const auto& t : tracks) {
-            if (t.timeSinceUpdate > 0) continue;
-            BoundingBox box = t.getBox();
-            cv::Rect r(
-                (int)box.x1, (int)box.y1,
-                (int)(box.x2 - box.x1), (int)(box.y2 - box.y1)
-            );
-            cv::rectangle(img, r, cv::Scalar(0, 255, 0), 2);
-            std::string label = "ID:" + std::to_string(t.id) + " "
-                              + std::string(CLASS_NAMES[t.classId]);
-            cv::putText(img, label, r.tl() + cv::Point(0, -4),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+            // Step 7: draw every track that was matched this frame (timeSinceUpdate == 0)
+            for (const auto& t : tracks) {
+                if (t.timeSinceUpdate > 0) continue;
+                BoundingBox box = t.getBox();
+                cv::Rect r(
+                    (int)box.x1, (int)box.y1,
+                    (int)(box.x2 - box.x1), (int)(box.y2 - box.y1)
+                );
+                cv::Scalar color = TRACK_COLORS[t.id % N_COLORS];
+                cv::rectangle(img, r, color, 2);
+                std::string label = "ID:" + std::to_string(t.id) + " "
+                                  + std::string(CLASS_NAMES[t.classId]);
+                cv::putText(img, label, r.tl() + cv::Point(0, -4),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
+            }
+        } else {
+            tracks.clear();
+            for (int j = 0; j < nD; j++) {
+                cv::Rect r(
+                    (int)detections[j].x1, (int)detections[j].y1,
+                    (int)(detections[j].x2 - detections[j].x1),
+                    (int)(detections[j].y2 - detections[j].y1)
+                );
+                cv::rectangle(img, r, cv::Scalar(0, 255, 0), 2);
+                cv::putText(img, CLASS_NAMES[detClasses[j]], r.tl() + cv::Point(0, -4),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+            }
         }
 
         // Dynamic threshold adjustment with hysteresis (every 5 frames to prevent flickering)
@@ -337,36 +436,15 @@ int main() {
             frameCount = 0;
             fpsTimer   = (double)cv::getTickCount();
         }
-        cv::putText(img, "FPS: " + std::to_string((int)fps),
-                    cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
-
-        cv::putText(img, "CONF: " + std::to_string(confThreshold).substr(0, 4),
-                    cv::Point(10, 100), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 200, 0), 2);
-
-        std::string nmsLabel = nmsEnabled ? "NMS: ON" : "NMS: OFF";
-        cv::Scalar  nmsColor = nmsEnabled ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
-        cv::putText(img, nmsLabel, cv::Point(10, 65),
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, nmsColor, 2);
-
-        cv::imshow("CUDA YOLO Detection", img);
-
         // Write frame and status for the web frontend
         cv::imwrite(frameOutPath, img);
         {
             std::ofstream sf(statusOutPath);
             sf << "{\"fps\":" << (int)fps
                << ",\"object_count\":" << keptCount
-               << ",\"nms_enabled\":" << (nmsEnabled ? "true" : "false") << "}";
-        }
-
-        int key = cv::waitKey(1);
-        if (key == 'q') {
-            running.store(false); // tell the capture thread to stop too
-            break;
-        }
-        if (key == 'n') {
-            nmsEnabled = 1 - nmsEnabled;
-            cv::setTrackbarPos("NMS", "CUDA YOLO Detection", nmsEnabled);
+               << ",\"nms_enabled\":"       << (nmsEnabled      ? "true" : "false")
+               << ",\"tracking_enabled\":" << (trackingEnabled ? "true" : "false")
+               << ",\"conf_threshold\":"   << confThreshold << "}";
         }
     }
 
@@ -375,6 +453,5 @@ int main() {
     frameCv.notify_all(); // wake it if it's sleeping in wait()
     captureThread.join(); // wait for capture thread to finish before destroying shared state
     cap.release();
-    cv::destroyAllWindows();
     return 0;
 }

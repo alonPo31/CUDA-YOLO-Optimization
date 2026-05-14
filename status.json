@@ -1,1 +1,1 @@
-{"fps":28,"object_count":1,"nms_enabled":true}
+{"fps":16,"object_count":4,"nms_enabled":true,"tracking_enabled":true,"conf_threshold":0.25}

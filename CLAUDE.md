@@ -65,29 +65,34 @@ blobFromImage → 640×640               net.forward() → 1×84×8400 tensor
                                       write latest_frame.jpg + status.json
 ```
 
-The capture thread overlaps camera I/O and `blobFromImage` preprocessing with GPU inference — this is the pipeline parallelism. Synchronization is a `std::mutex` + `std::condition_variable` on `FrameBuffer`.
+The capture thread overlaps camera I/O and `blobFromImage` preprocessing with GPU inference. Synchronization is a `std::mutex` + `std::condition_variable` on `FrameBuffer`.
 
 ### File-based IPC (C++ ↔ Flask)
 
 | File | Written by | Read by | Purpose |
 |---|---|---|---|
-| `latest_frame.jpg` | C++ (every frame) | Flask `/video_feed` (MJPEG) | live stream |
-| `status.json` | C++ (every frame) | Flask `/status` | FPS, object count, NMS flag |
-| `frontend_config.json` | Flask `/toggle_nms` | C++ (every 15 frames) | NMS on/off toggle |
+| `latest_frame.jpg` | C++ (every frame) | Flask `/frame` (JPEG poll) | live stream |
+| `status.json` | C++ (every frame) | Flask `/status` | FPS, object count, conf threshold, toggle states |
+| `frontend_config.json` | Flask `/toggle_nms`, `/toggle_tracking` | C++ (every 15 frames) | NMS + tracking on/off |
+
+The React frontend polls `/frame` every ~33 ms (not MJPEG) and `/status` every 500 ms. Toggles POST to Flask which writes `frontend_config.json`; C++ reads it on the next sync cycle.
 
 ### Key data structures
 
 **`BoundingBox`** (`nms.h`) — `{x1, y1, x2, y2, confidence}` in original image pixel space (scaled from 640-space).
 
-**`KalmanTracker`** (`tracker.h`) — state vector `[cx, cy, w, h, vx, vy, vw, vh]` (8×1). Constant-velocity motion model. All matrix math (including Gauss-Jordan inversion) is implemented from scratch in `tracker.cpp` — no `<cmath>`, no `<algorithm>`.
+**`KalmanTracker`** (`tracker.h`) — state vector `[cx, cy, w, h, vx, vy, vw, vh]` (8×1). Constant-velocity motion model. All matrix math (including Gauss-Jordan inversion) is implemented from scratch in `tracker.cpp` — no external math library.
 
 **`Matrix`** (`tracker.h`) — row-major flat `vector<float>`, `at(r, c)` accessor.
 
-### CUDA kernels (`nms.cu`)
+### CUDA NMS kernel (`nms.cu`)
 
-- **`calculateIoUMatrix`** — 2D grid `(n+15)/16 × (n+15)/16`, 16×16 blocks. Fills a symmetric n×n IoU matrix.
-- **`nmsKernel`** — 1 block × n threads. Thread i suppresses itself if any j < i has IoU > threshold. **Hard limit: n ≤ 1024.**
-- **`runCudaNMS`** — `extern "C"` wrapper: alloc device memory → IoU matrix kernel → NMS kernel → copy results back.
+The implementation uses a **bitmask approach** with a `cudaStream_t` for async GPU operations:
+
+- **`nms_bitmask_kernel`** — 2D grid of `(n+63)/64 × (n+63)/64` blocks, 64 threads per block. Each block handles a 64×64 tile of box comparisons. Column boxes are loaded into `__shared__` memory once per block; each thread computes IoU against all 64 column boxes and writes a 64-bit mask. Only the upper triangle is computed (IoU is symmetric). No hard limit on n.
+- **`runCudaNMS`** — `extern "C"` wrapper: creates a stream → `cudaMemsetAsync` → `cudaMemcpyAsync` (H2D) → kernel → `cudaMemcpyAsync` (D2H) → `cudaStreamSynchronize` → greedy CPU bitmask scan → `cudaStreamDestroy`.
+
+The greedy CPU scan uses a `remv` bitmask vector: iterates boxes in confidence order, keeps any box not flagged in `remv`, then OR-merges that box's mask row into `remv` to suppress its overlapping neighbors.
 
 ### Dynamic confidence threshold
 
@@ -106,16 +111,16 @@ Lives in `main.cpp`, adjusted every 5 frames (hysteresis):
 
 | Component | Status |
 |---|---|
-| YOLOv8 ONNX inference (OpenCV DNN + CUDA) | ✅ Done |
-| GPU-parallelized NMS | ✅ Done |
-| Camera capture loop + capture-thread pipeline parallelism | ✅ Done |
+| YOLOv8 ONNX inference (OpenCV DNN + CUDA backend) | ✅ Done |
+| GPU-parallelized bitmask NMS | ✅ Done |
+| CUDA Streams for async GPU memory transfers | ✅ Done |
+| Camera capture thread + pipeline parallelism | ✅ Done |
 | Dynamic adaptive confidence threshold | ✅ Done |
 | Kalman Filter + Hungarian algorithm tracking | ✅ Done |
-| Flask MJPEG server + React frontend | ✅ Done |
-| CUDA Streams for async GPU memory transfers | ❌ Not yet |
+| Flask server + React frontend with live toggles | ✅ Done |
 
 ## Known limitations
 
-- `nmsKernel` uses 1 block × n threads — crashes if `n > 1024`. Fix: bitmask NMS kernel (each thread i writes a 64-bit suppress-mask, results are OR-reduced), enabling multi-block execution without the n×n matrix.
-- No `cudaGetLastError` / `cudaDeviceSynchronize` error checking anywhere in `nms.cu`.
-- `tracker.cpp` must be manually added to the Visual Studio project (right-click project → Add → Existing Item) — it is not yet in `YOLO_CUDA_Project.vcxproj`.
+- No `cudaGetLastError` checking in `nms.cu` — GPU errors are silent.
+- `tracker.cpp` must be manually added to the Visual Studio project (right-click → Add → Existing Item) if it was removed; it is not auto-discovered by the `.vcxproj`.
+- All file paths in `main.cpp` and `app.py` are hardcoded to `C:/Alon/CUDA-YOLO-Optimization/`.
