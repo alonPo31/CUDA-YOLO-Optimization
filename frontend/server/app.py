@@ -16,10 +16,13 @@ UPLOAD_DIR  = f'{BASE}/uploads'
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-if not os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH, 'w') as f:
-        json.dump({'nms_enabled': True, 'tracking_enabled': True,
-                   'video_source': 'camera', 'video_path': ''}, f)
+
+DEFAULT_CONFIG = {
+    'nms_enabled':      True,
+    'tracking_enabled': True,
+    'video_source':     'camera',
+    'video_path':       '',
+}
 
 
 def read_json(path, default):
@@ -35,14 +38,41 @@ def write_json(path, data):
         json.dump(data, f)
 
 
+def load_config():
+    """Read config and fill in any missing keys with defaults.
+    Older config files on disk may be missing keys (e.g. tracking_enabled),
+    which would KeyError in the toggle endpoints — setdefault prevents that.
+    """
+    cfg = read_json(CONFIG_PATH, {})
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+# Always reset video source to camera on startup so C++ never inherits a stale file path
+_cfg = load_config()
+_cfg['video_source'] = 'camera'
+_cfg['video_path']   = ''
+write_json(CONFIG_PATH, _cfg)
+
+
 def generate_frames():
+    last_good = None
     while True:
         try:
             with open(FRAME_PATH, 'rb') as f:
                 frame_bytes = f.read()
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            # Accept only complete JPEGs: FF D8 header + FF D9 footer.
+            # Partial reads (C++ mid-write on Windows) fail this check; we fall
+            # back to the previous good frame so the browser never sees black.
+            if (len(frame_bytes) > 1000
+                    and frame_bytes[:2] == b'\xff\xd8'
+                    and frame_bytes[-2:] == b'\xff\xd9'):
+                last_good = frame_bytes
         except Exception:
             pass
+        if last_good:
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + last_good + b'\r\n')
         time.sleep(1 / 30)
 
 
@@ -70,7 +100,7 @@ def status():
 
 @app.route('/toggle_nms', methods=['POST'])
 def toggle_nms():
-    config = read_json(CONFIG_PATH, {'nms_enabled': True, 'tracking_enabled': True})
+    config = load_config()
     config['nms_enabled'] = not config['nms_enabled']
     write_json(CONFIG_PATH, config)
     return jsonify(config)
@@ -78,7 +108,7 @@ def toggle_nms():
 
 @app.route('/toggle_tracking', methods=['POST'])
 def toggle_tracking():
-    config = read_json(CONFIG_PATH, {'nms_enabled': True, 'tracking_enabled': True})
+    config = load_config()
     config['tracking_enabled'] = not config['tracking_enabled']
     write_json(CONFIG_PATH, config)
     return jsonify(config)
@@ -95,7 +125,7 @@ def upload_video():
 
     # Tell the C++ backend to switch from camera to this file.
     # C++ reads frontend_config.json every 15 frames and will restart its VideoCapture.
-    config = read_json(CONFIG_PATH, {'nms_enabled': True, 'tracking_enabled': True})
+    config = load_config()
     config['video_source'] = 'file'
     config['video_path']   = save_path
     write_json(CONFIG_PATH, config)
@@ -105,7 +135,7 @@ def upload_video():
 
 @app.route('/switch_to_camera', methods=['POST'])
 def switch_to_camera():
-    config = read_json(CONFIG_PATH, {'nms_enabled': True, 'tracking_enabled': True})
+    config = load_config()
     config['video_source'] = 'camera'
     config['video_path']   = ''
     write_json(CONFIG_PATH, config)

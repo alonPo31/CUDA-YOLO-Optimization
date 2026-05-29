@@ -105,6 +105,7 @@ void KalmanTracker::init(const BoundingBox& box) {
     id              = nextId++;
     timeSinceUpdate = 0;
     age             = 0;
+    hits            = 1; // birth detection counts as the first hit
 
     float cx = (box.x1 + box.x2) / 2.0f;
     float cy = (box.y1 + box.y2) / 2.0f;
@@ -186,6 +187,7 @@ void KalmanTracker::update(const BoundingBox& box) {
     P = matMul(matSub(I8, matMul(K, H)), P);
 
     timeSinceUpdate = 0;
+    hits++;
 }
 
 BoundingBox KalmanTracker::getBox() const {

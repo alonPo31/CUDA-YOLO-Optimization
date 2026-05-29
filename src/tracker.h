@@ -45,6 +45,7 @@ struct KalmanTracker {
     int id;              // unique track ID, assigned at birth
     int timeSinceUpdate; // frames since last matched detection
     int age;             // total frames this track has existed
+    int hits;            // total successful matches (init counts as 1) — used for min_hits gating
     int classId = 0;     // COCO class index of the detection that spawned/last updated this track
 
     Matrix x;   // state (8x1)

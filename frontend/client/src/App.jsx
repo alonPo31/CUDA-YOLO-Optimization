@@ -13,34 +13,13 @@ export default function App() {
   })
   const [connected, setConnected]     = useState(false)
   const [selectedFile, setSelectedFile] = useState(null)
-  const [uploading, setUploading]     = useState(false)
+  const [uploading, setUploading]       = useState(false)
   const [uploadStarted, setUploadStarted] = useState(false)
-  const streamRef = useRef(null)
+  const [streamKey, setStreamKey]       = useState(0)
+  const retryRef = useRef(null)
+  const imgRef   = useRef(null)
 
   const inDetection = mode === 'live' || (mode === 'upload' && uploadStarted)
-
-  // Frame polling — only while in the detection view
-  useEffect(() => {
-    if (!inDetection) return
-    let active = true
-    let tid
-
-    function nextFrame() {
-      if (!active) return
-      const tmp = new window.Image()
-      tmp.onload = () => {
-        if (active && streamRef.current) streamRef.current.src = tmp.src
-        tid = setTimeout(nextFrame, 0)
-      }
-      tmp.onerror = () => {
-        if (active) tid = setTimeout(nextFrame, 200)
-      }
-      tmp.src = `${API}/frame?t=${Date.now()}`
-    }
-
-    nextFrame()
-    return () => { active = false; clearTimeout(tid) }
-  }, [inDetection])
 
   // Status polling — only while in the detection view
   useEffect(() => {
@@ -50,12 +29,24 @@ export default function App() {
         const res  = await fetch(`${API}/status`)
         const data = await res.json()
         setStatus(data)
-        setConnected(true)
+        setConnected(data.fps > 0)
       } catch {
         setConnected(false)
       }
     }, 500)
     return () => clearInterval(interval)
+  }, [inDetection])
+
+  // Watchdog: Chrome sets img.complete=true when the MJPEG connection drops (even
+  // silently, without firing onError). Reconnect within 2 seconds when that happens.
+  useEffect(() => {
+    if (!inDetection) return
+    const id = setInterval(() => {
+      if (imgRef.current?.complete) {
+        setStreamKey(k => k + 1)
+      }
+    }, 2000)
+    return () => clearInterval(id)
   }, [inDetection])
 
   const toggleNMS = async () => {
@@ -86,9 +77,14 @@ export default function App() {
     setUploading(false)
   }
 
+  const handleLiveDetection = async () => {
+    try { await fetch(`${API}/switch_to_camera`, { method: 'POST' }) } catch {}
+    setMode('live')
+  }
+
   const handleBack = async () => {
-    // If leaving upload mode, tell C++ to switch back to camera
-    if (mode === 'upload' && uploadStarted) {
+    clearTimeout(retryRef.current)
+    if (mode === 'upload') {
       try { await fetch(`${API}/switch_to_camera`, { method: 'POST' }) } catch {}
     }
     setMode('select')
@@ -116,7 +112,7 @@ export default function App() {
             Full pipeline: YOLO · GPU NMS · Dynamic Threshold · Kalman Tracking
           </div>
           <div className="mode-cards">
-            <div className="mode-card" onClick={() => setMode('live')}>
+            <div className="mode-card" onClick={handleLiveDetection}>
               <div className="mode-card-icon">📷</div>
               <div className="mode-card-name">Live Detection</div>
               <div className="mode-card-desc">
@@ -228,9 +224,15 @@ export default function App() {
         <main className="stream-area">
           <div className="stream-frame">
             <img
-              ref={streamRef}
+              ref={imgRef}
+              key={streamKey}
+              src={`${API}/video_feed`}
               className="stream"
               alt="Detection stream"
+              onError={() => {
+                clearTimeout(retryRef.current)
+                retryRef.current = setTimeout(() => setStreamKey(k => k + 1), 1000)
+              }}
             />
           </div>
         </main>
