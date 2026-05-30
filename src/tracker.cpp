@@ -106,62 +106,74 @@ void KalmanTracker::init(const BoundingBox& box) {
     timeSinceUpdate = 0;
     age             = 0;
     hits            = 1; // birth detection counts as the first hit
+    for (int k = 0; k < 80; k++) classHistogram[k] = 0;
 
     float cx = (box.x1 + box.x2) / 2.0f;
     float cy = (box.y1 + box.y2) / 2.0f;
     float w  =  box.x2 - box.x1;
     float h  =  box.y2 - box.y1;
 
-    x = Matrix(8, 1);
+    // 6-state vector: [cx, cy, w, h, vx, vy]. No vw/vh — see comment in tracker.h.
+    x = Matrix(6, 1);
     x.at(0, 0) = cx;
     x.at(1, 0) = cy;
     x.at(2, 0) = w;
     x.at(3, 0) = h;
 
-    // F: constant-velocity model — position advances by one frame of velocity
-    F = matIdentity(8);
-    F.at(0, 4) = 1.0f;
-    F.at(1, 5) = 1.0f;
-    F.at(2, 6) = 1.0f;
-    F.at(3, 7) = 1.0f;
+    // F: constant-velocity model ONLY on position. w and h are static across predict;
+    // measurements update them via Kalman gain (EMA behavior).
+    F = matIdentity(6);
+    F.at(0, 4) = 1.0f;   // cx_next = cx + vx
+    F.at(1, 5) = 1.0f;   // cy_next = cy + vy
 
-    // H: YOLO measures only [cx, cy, w, h] — the first 4 elements of the state
-    H = Matrix(4, 8);
+    // H: measure [cx, cy, w, h] — first 4 state components.
+    H = Matrix(4, 6);
     H.at(0, 0) = 1.0f;
     H.at(1, 1) = 1.0f;
     H.at(2, 2) = 1.0f;
     H.at(3, 3) = 1.0f;
 
-    // Q: process noise — position can drift slightly, velocity drift is tiny
-    Q = Matrix(8, 8);
+    // Q: process noise per predict step.
+    //   Position 1.0 — small frame-to-frame drift expected from noise.
+    //   Size 4.0    — must let w/h follow real changes (e.g. arms opening) since
+    //                 there's no velocity component to predict them forward.
+    //   Velocity 0.1 — was 0.01 (too rigid for moving objects), conservatively bumped
+    //                  10x. Higher caused position drift during long YOLO drops last time.
+    Q = Matrix(6, 6);
     Q.at(0, 0) = 1.0f;
     Q.at(1, 1) = 1.0f;
-    Q.at(2, 2) = 1.0f;
-    Q.at(3, 3) = 1.0f;
-    Q.at(4, 4) = 0.01f;
-    Q.at(5, 5) = 0.01f;
-    Q.at(6, 6) = 0.01f;
-    Q.at(7, 7) = 0.01f;
+    Q.at(2, 2) = 4.0f;
+    Q.at(3, 3) = 4.0f;
+    Q.at(4, 4) = 0.1f;
+    Q.at(5, 5) = 0.1f;
 
-    // R: measurement noise — size (w, h) is noisier than center position
+    // R: measurement noise. Tuned to dampen the residual ~2px box jitter that
+    //    YOLO produces on static objects. With Q(pos)=1 these R values give
+    //    steady-state Kalman gain ~0.42 on position and ~0.46 on size — about
+    //    a third less measurement pass-through than at R=(1,5), so most of YOLO's
+    //    per-frame wobble gets absorbed into the prediction. Cost is a slight
+    //    lag (1-2 frames) on fast motion; raise position R further for more
+    //    smoothing or drop to (2, 8) if real motion feels too sluggish.
     R = Matrix(4, 4);
-    R.at(0, 0) = 1.0f;
-    R.at(1, 1) = 1.0f;
+    R.at(0, 0) = 3.0f;
+    R.at(1, 1) = 3.0f;
     R.at(2, 2) = 10.0f;
     R.at(3, 3) = 10.0f;
 
-    // P: high initial uncertainty on velocity, lower on position
-    P = Matrix(8, 8);
+    // P: initial uncertainty.
+    //   Position/size 10  — standard, converges quickly.
+    //   Velocity 100      — was 10000. The huge value made the very first update
+    //                        absorb most of the displacement as velocity, producing
+    //                        the overshoot that arms-open / arms-close exhibited.
+    P = Matrix(6, 6);
     P.at(0, 0) = 10.0f;
     P.at(1, 1) = 10.0f;
     P.at(2, 2) = 10.0f;
     P.at(3, 3) = 10.0f;
-    P.at(4, 4) = 10000.0f;
-    P.at(5, 5) = 10000.0f;
-    P.at(6, 6) = 10000.0f;
-    P.at(7, 7) = 10000.0f;
+    P.at(4, 4) = 100.0f;
+    P.at(5, 5) = 100.0f;
 
-    I8 = matIdentity(8);
+    I8 = matIdentity(6);
 }
 
 void KalmanTracker::predict() {
@@ -172,11 +184,34 @@ void KalmanTracker::predict() {
 }
 
 void KalmanTracker::update(const BoundingBox& box) {
+    float cx = (box.x1 + box.x2) / 2.0f;
+    float cy = (box.y1 + box.y2) / 2.0f;
+    float w  =  box.x2 - box.x1;
+    float h  =  box.y2 - box.y1;
+
+    // Size gate: clamp the per-frame size change to ±25%. With Q(w,h)=4 and R(w,h)=5
+    // the steady-state Kalman gain on size is ~0.58, so a single YOLO blowup (e.g.
+    // person box merging with furniture for one frame) would still pass ~60% through.
+    // Raising R adds permanent lag to real motion; this non-linear gate clamps only
+    // outlier jumps while leaving normal walking-toward-camera growth untouched (a
+    // person almost never grows >25% in one frame at 30 FPS).
+    const float MAX_GROW   = 1.25f;
+    const float MAX_SHRINK = 0.80f;
+    float curW = x.at(2, 0), curH = x.at(3, 0);
+    if (curW > 1.0f) {
+        w = minf(w, curW * MAX_GROW);
+        w = maxf(w, curW * MAX_SHRINK);
+    }
+    if (curH > 1.0f) {
+        h = minf(h, curH * MAX_GROW);
+        h = maxf(h, curH * MAX_SHRINK);
+    }
+
     Matrix z(4, 1);
-    z.at(0, 0) = (box.x1 + box.x2) / 2.0f;
-    z.at(1, 0) = (box.y1 + box.y2) / 2.0f;
-    z.at(2, 0) =  box.x2 - box.x1;
-    z.at(3, 0) =  box.y2 - box.y1;
+    z.at(0, 0) = cx;
+    z.at(1, 0) = cy;
+    z.at(2, 0) = w;
+    z.at(3, 0) = h;
 
     Matrix Ht = matTranspose(H);
     Matrix y  = matSub(z, matMul(H, x));

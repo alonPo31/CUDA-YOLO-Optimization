@@ -378,7 +378,19 @@ int main() {
                         int j = assignment[i];
                         if (j != -1 && (1.0f - costMatrix[i][j]) >= IOU_THRESHOLD) {
                             localTracks[i].update(highDets[j]);
-                            localTracks[i].classId = highCls[j];
+                            // Class voting with hysteresis: record this HIGH-conf vote.
+                            // Switch the displayed classId only if the argmax class holds
+                            // a strict majority (>=60%) of all votes. Prevents the label
+                            // flipping back-and-forth on alternating misclassifications.
+                            int* hist = localTracks[i].classHistogram;
+                            hist[highCls[j]]++;
+                            int total = 0, best = 0;
+                            for (int k = 0; k < 80; k++) {
+                                total += hist[k];
+                                if (hist[k] > hist[best]) best = k;
+                            }
+                            if (hist[best] * 5 >= total * 3) // hist[best] / total >= 0.6
+                                localTracks[i].classId = best;
                             trackMatched[i] = true;
                             highMatched[j] = true;
                         }
@@ -417,14 +429,29 @@ int main() {
                 }
 
                 // Spawn new tracks only from unmatched HIGH detections — never from LOW,
-                // so weak false positives never produce flash boxes.
+                // so weak false positives never produce flash boxes. Additionally, skip
+                // any detection that significantly overlaps an existing CONFIRMED track,
+                // even of a different class — this kills the chair-also-detected-as-bottle
+                // duplicate-box case where class-aware matching rejects the second class
+                // but spawn would otherwise create a parallel track on the same object.
                 for (int j = 0; j < nH; j++) {
-                    if (!highMatched[j]) {
-                        KalmanTracker newTrack;
-                        newTrack.init(highDets[j]);
-                        newTrack.classId = highCls[j];
-                        localTracks.push_back(newTrack);
+                    if (highMatched[j]) continue;
+
+                    bool overlapsExisting = false;
+                    for (const auto& t : localTracks) {
+                        if (t.hits < MIN_HITS) continue;
+                        if (computeIoU(t.getBox(), highDets[j]) > 0.5f) {
+                            overlapsExisting = true;
+                            break;
+                        }
                     }
+                    if (overlapsExisting) continue;
+
+                    KalmanTracker newTrack;
+                    newTrack.init(highDets[j]);
+                    newTrack.classId = highCls[j];
+                    newTrack.classHistogram[highCls[j]] = 1;
+                    localTracks.push_back(newTrack);
                 }
 
                 {
